@@ -25,6 +25,9 @@ esphome:
 wifi:
   # A reboot would restart the failover countdown and interrupt local control.
   reboot_timeout: 0s
+  on_disconnect:
+    then:
+      - script.execute: ccf_connection_lost
 
 api:
   # Keep the ESP32 alive when Home Assistant is unavailable.
@@ -33,12 +36,7 @@ api:
     then:
       - lambda: |-
           if (!id(api_server).is_connected_with_state_subscription()) {
-            id(ccf_values_seen) = 0;
-            id(ccf_ha_ready) = false;
-            id(ccf_good_tracking) = false;
-            blueprint_status_flags.reset();
-            system_flags.blueprint_ready = false;
-            id(ccf_apply_output).execute();
+            id(ccf_connection_lost).execute();
           }
 
 # ccf_owner:
@@ -304,6 +302,21 @@ interval:
       - script.execute: ccf_supervisor
 
 script:
+  # A Wi-Fi link loss is authoritative even while the old API socket still
+  # reports a subscription. Start the loss timer at this event, not at its
+  # eventual TCP timeout. Logger-only API disconnects do not invoke this path.
+  - id: ccf_connection_lost
+    mode: single
+    then:
+      - lambda: |-
+          id(ccf_values_seen) = 0;
+          id(ccf_ha_ready) = false;
+          id(ccf_good_tracking) = false;
+          blueprint_status_flags.reset();
+          system_flags.blueprint_ready = false;
+          id(ccf_apply_output).execute();
+          id(ccf_supervisor).execute();
+
   - id: !extend dump_config
     then:
       - lambda: |-
@@ -350,6 +363,7 @@ script:
                      id(thermostat_embedded).action == climate::CLIMATE_ACTION_HEATING;
           } else if (id(ccf_owner) == 1) {
             demand = id(ccf_ha_ready) &&
+                     id(wifi_component).is_connected() &&
                      id(api_server).is_connected_with_state_subscription() &&
                      is_blueprint_fully_ready() &&
                      id(ccf_values_seen) == 7 &&
@@ -388,7 +402,8 @@ script:
           static uint32_t last_request = 0;
           static uint32_t last_log = 0;
 
-          const bool connected = id(api_server).is_connected_with_state_subscription();
+          const bool wifi_ok = id(wifi_component).is_connected();
+          const bool connected = wifi_ok && id(api_server).is_connected_with_state_subscription();
           if (!connected) {
             id(ccf_values_seen) = 0;
           }
@@ -472,14 +487,15 @@ script:
           }
 
           if (id(ccf_status).state != status) {
+            ESP_LOGI("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}", "%s", status);
             id(ccf_status).publish_state(status);
           }
 
           if ((uint32_t)(now - last_log) >= 30000U) {
             last_log = now;
             ESP_LOGD("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}",
-                     "owner=%u api=%d blueprint=%d values=%u display=%d",
-                     (unsigned) id(ccf_owner), connected, blueprint_ok,
+                     "owner=%u wifi=%d api=%d blueprint=%d values=%u display=%d",
+                     (unsigned) id(ccf_owner), wifi_ok, connected, blueprint_ok,
                      (unsigned) id(ccf_values_seen), id(disp1).is_setup());
           }
 

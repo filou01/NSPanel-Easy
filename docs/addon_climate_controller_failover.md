@@ -206,7 +206,10 @@ network loss does not affect saved values in memory.
 
 ### Loss of Home Assistant or Blueprint readiness
 
-A disconnect immediately prevents stale HA state from energizing the relay. If readiness does not recover within `climate_failover_loss_wait_ms`, the panel enters `LOCAL` mode.
+A Wi-Fi disconnect immediately blocks HA output, clears readiness, and starts
+the loss interval, even if the API socket still reports a state subscription.
+Loss of the last state-subscribing API client has the same effect. If readiness
+does not recover within `climate_failover_loss_wait_ms`, the panel enters LOCAL.
 
 The local thermostat then:
 
@@ -224,7 +227,7 @@ Offline changes are deliberately **not written back** to Home Assistant. On reco
 
 A simple TCP/API reconnect is not enough. The add-on waits until:
 
-1. the ESPHome API has a client with state subscriptions;
+1. Wi-Fi is connected and the ESPHome API has a client with state subscriptions;
 2. the NSPanel Easy Blueprint is ready;
 3. a valid HA climate mode has been received;
 4. a finite HA target within `temp_min..temp_max`, in panel units, has been received;
@@ -250,7 +253,9 @@ The add-on creates `sensor`-style diagnostic text entity **Climate Controller Fa
 - `LOCAL: HA values missing`
 - `LOCAL: preparing handback`
 
-Debug logging uses the tag `nspanel.addon.climate.controller_failover` and prints owner, API, Blueprint, value mask and display state every 30 seconds.
+Status transitions are logged at INFO with the tag
+`nspanel.addon.climate.controller_failover`. DEBUG logging additionally reports
+owner, Wi-Fi, API, Blueprint, value mask and display state every 30 seconds.
 
 ## Reboot behavior
 
