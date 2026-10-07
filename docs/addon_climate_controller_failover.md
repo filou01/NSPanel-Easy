@@ -266,6 +266,17 @@ local control.
 A power loss still causes a normal reboot. After boot, the panel waits `climate_failover_boot_wait_ms`. If
 Home Assistant is still unavailable after that interval, the locally stored target and mode are restored.
 
+The default boot wait is `120000` milliseconds (**2 minutes**). After a restart without Wi-Fi or a ready
+Home Assistant connection, the local Climate page and local target/mode adjustment are not activated until
+this wait has elapsed and LOCAL ownership begins. The panel may show the clock/screensaver during this
+interval; local control is not immediately available after an offline restart. Display initialization must
+also complete before the local page can be shown.
+
+Configure `climate_failover_boot_wait_ms` to change this startup wait. It is separate from the default
+30-second `climate_failover_loss_wait_ms` used when HA becomes unavailable during normal operation.
+Thermostat startup and minimum-time protections can further delay the relay switching on after LOCAL
+ownership begins; the boot wait alone does not determine when heating starts.
+
 ## UI behavior
 
 When local ownership starts, the add-on switches the Climate detail page to `embedded_climate` and labels it
