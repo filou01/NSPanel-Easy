@@ -1,0 +1,8 @@
+---
+substitutions:
+  temp_units: "°F"
+  heater_relay: "1"
+
+packages:
+  controller_failover: !include esphome_idf_climate_controller_failover.yaml
+...

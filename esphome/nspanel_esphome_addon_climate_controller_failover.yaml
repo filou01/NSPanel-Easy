@@ -1,0 +1,757 @@
+#####################################################################################################
+#####                 NSPanel Easy - https://github.com/edwardtfn/NSPanel-Easy                  #####
+#####################################################################################################
+##### ESPHome Add-on for Climate Controller Failover                                              #####
+##### PLEASE only make changes if it is necessary and also the required knowledge is available. #####
+##### For normal use with the Blueprint, no changes are necessary.                              #####
+#####################################################################################################
+##### ATTENTION: Requires the Climate Heat add-on and takes exclusive ownership of its relay.    #####
+#####################################################################################################
+---
+substitutions:
+  heater_relay: "1"
+  climate_failover_boot_wait_ms: "120000"
+  climate_failover_loss_wait_ms: "30000"
+  climate_failover_return_wait_ms: "10000"
+  climate_failover_initial_target: ${70 if TEMP_UNIT_IS_FAHRENHEIT else 21}
+  climate_failover_initial_heat: "false"
+  climate_failover_local_label: "Local heating"
+  TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER: nspanel.addon.climate.controller_failover
+
+esphome:
+  build_flags:
+    - -D NSPANEL_EASY_ADDON_CLIMATE_CONTROLLER_FAILOVER
+
+wifi:
+  # A reboot would restart the failover countdown and interrupt local control.
+  reboot_timeout: 0s
+
+api:
+  # Keep the ESP32 alive when Home Assistant is unavailable.
+  reboot_timeout: 0s
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          if (!id(api_server).is_connected_with_state_subscription()) {
+            id(ccf_values_seen) = 0;
+            id(ccf_ha_ready) = false;
+            id(ccf_good_tracking) = false;
+            blueprint_status_flags.reset();
+            system_flags.blueprint_ready = false;
+            id(ccf_apply_output).execute();
+          }
+
+# ccf_owner:
+# 0 = startup / transfer state
+# 1 = external Home Assistant controller
+# 2 = local embedded thermostat
+globals:
+  - id: ccf_owner
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: ccf_values_seen
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: ccf_ha_ready
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: ccf_good_tracking
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: ccf_good_since
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: ccf_ui_started
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: ccf_saved_target
+    type: float
+    restore_value: true
+    # Persist Celsius so changing panel display units cannot reinterpret NVS data.
+    initial_value: '${"fahrenheit_to_celsius" if TEMP_UNIT_IS_FAHRENHEIT else ""}(static_cast<float>(${climate_failover_initial_target}))'
+
+  - id: ccf_saved_heat
+    type: bool
+    restore_value: true
+    initial_value: '${climate_failover_initial_heat}'
+
+  - id: ccf_home_dirty
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
+  - id: ccf_display_needs_init
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
+display:
+  - id: !extend disp1
+    on_setup:
+      then:
+        - lambda: |-
+            id(ccf_ui_started) = false;
+            id(ccf_home_dirty) = true;
+            id(ccf_display_needs_init) = true;
+
+# Preserve the standard relay ID for chips/buttons, but remove its GPIO access.
+# Requests through this read-only proxy are re-evaluated by the arbiter; they
+# cannot bypass ownership. Only ccf_heater_output owns the physical pin.
+switch:
+  - id: !extend relay_${heater_relay}
+    platform: template
+    pin: !remove
+    internal: true
+    restore_mode: ALWAYS_OFF
+    optimistic: false
+    turn_on_action:
+      - script.execute: ccf_apply_output
+    turn_off_action:
+      - script.execute: ccf_apply_output
+
+  - platform: gpio
+    id: ccf_heater_output
+    pin: ${GPIO_RELAY_1_PIN if heater_relay | int == 1 else GPIO_RELAY_2_PIN}
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_state:
+      then:
+        - lambda: id(relay_${heater_relay}).publish_state(x);
+
+sensor:
+  - platform: homeassistant
+    id: ccf_ha_target
+    entity_id: ${controller_climate_entity}
+    attribute: temperature
+    internal: true
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (std::isfinite(x) && x >= ${temp_min} && x <= ${temp_max}) {
+              id(ccf_values_seen) |= 2;
+            } else {
+              id(ccf_values_seen) &= ~2;
+              id(ccf_good_tracking) = false;
+              id(ccf_ha_ready) = false;
+            }
+    on_value:
+      then:
+        - lambda: |-
+            if (id(ccf_owner) == 1 && (id(ccf_values_seen) & 2)) {
+              #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+              id(ccf_saved_target) = fahrenheit_to_celsius(x);
+              #else  // Celsius
+              id(ccf_saved_target) = x;
+              #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+            }
+        - script.execute: ccf_supervisor
+        - script.execute: ccf_apply_output
+
+text_sensor:
+  - platform: homeassistant
+    id: ccf_ha_mode
+    entity_id: ${controller_climate_entity}
+    internal: true
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (x == "heat" || x == "off") {
+              id(ccf_values_seen) |= 1;
+            } else {
+              id(ccf_values_seen) &= ~1;
+              id(ccf_good_tracking) = false;
+              id(ccf_ha_ready) = false;
+            }
+    on_value:
+      then:
+        - lambda: |-
+            if (id(ccf_owner) == 1 && (id(ccf_values_seen) & 1)) {
+              id(ccf_saved_heat) = x == "heat";
+            }
+        - script.execute: ccf_supervisor
+        - script.execute: ccf_apply_output
+
+  - platform: homeassistant
+    id: ccf_ha_demand
+    entity_id: ${controller_heat_request_entity}
+    internal: true
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (x == "on" || x == "off") {
+              id(ccf_values_seen) |= 4;
+            } else {
+              id(ccf_values_seen) &= ~4;
+              id(ccf_good_tracking) = false;
+              id(ccf_ha_ready) = false;
+            }
+    on_value:
+      then:
+        - script.execute: ccf_supervisor
+        - script.execute: ccf_apply_output
+
+  - platform: template
+    name: "Climate Controller Failover Status"
+    id: ccf_status
+    entity_category: diagnostic
+    update_interval: never
+
+  - id: !extend detailed_entity
+    on_raw_value:
+      then:
+        - lambda: |-
+            if (id(ccf_owner) == 2 &&
+                current_page_id == get_page_id("climate") &&
+                x != "${CLIMATE_EMBEDDED_SENTINEL}") {
+              id(ccf_repair_climate).execute();
+            }
+
+climate:
+  - id: !extend thermostat_embedded
+    # Start OFF. The failover supervisor restores the last safe mode only when
+    # local ownership is actually granted.
+    internal: true
+    on_boot_restore_from: default_preset
+    default_preset: "Off"
+    visual:
+      temperature_step:
+        target_temperature: ${1 if TEMP_UNIT_IS_FAHRENHEIT else 0.1} ${temp_units}
+        current_temperature: ${1 if TEMP_UNIT_IS_FAHRENHEIT else 0.1} ${temp_units}
+
+    # Replace the heat add-on relay actions. Relay ownership is centralized in
+    # ccf_apply_output so both controllers can never drive the output in parallel.
+    heat_action:
+      then:
+        - script.execute: ccf_apply_output
+
+    idle_action:
+      then:
+        - script.execute: ccf_apply_output
+
+    # Replace the heat add-on state automation so target/mode changes do not
+    # reconstruct the Home page while the local climate page is in use.
+    on_state:
+      - then:
+          - lambda: |-
+              if (id(ccf_owner) == 2) {
+                const float target = id(thermostat_embedded).target_temperature;
+                if (std::isfinite(target)) {
+                  id(ccf_saved_target) = target;
+                }
+                id(ccf_saved_heat) =
+                  id(thermostat_embedded).mode == climate::CLIMATE_MODE_HEAT;
+              }
+
+              id(ccf_apply_output).execute();
+              if (!id(disp1).is_setup() || system_flags.tft_upload_active) {
+                return;
+              }
+
+              const float current = id(thermostat_embedded).current_temperature;
+              const float target = id(thermostat_embedded).target_temperature;
+              #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+              const int current10 = std::isfinite(current) ? lroundf(celsius_to_fahrenheit(current)) : -32768;
+              const int target10 = std::isfinite(target) ? lroundf(celsius_to_fahrenheit(target)) : -32768;
+              #else  // Celsius
+              const int current10 = std::isfinite(current) ? lroundf(current * 10) : -32768;
+              const int target10 = std::isfinite(target) ? lroundf(target * 10) : -32768;
+              #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+              const int mode = static_cast<int>(id(thermostat_embedded).mode);
+              const int action = static_cast<int>(id(thermostat_embedded).action);
+              static int previous_current = -32769;
+              static int previous_target = -32769;
+              static int previous_mode = -1;
+              static int previous_action = -1;
+              const bool changed = current10 != previous_current ||
+                                   target10 != previous_target ||
+                                   mode != previous_mode ||
+                                   action != previous_action;
+              previous_current = current10;
+              previous_target = target10;
+              previous_mode = mode;
+              previous_action = action;
+
+              if (changed && climate_embedded_visible &&
+                  current_page_id == get_page_id("climate")) {
+                if (id(ccf_owner) == 2) {
+                  addon_climate_friendly_name = "${climate_failover_local_label}";
+                }
+                id(page_climate).execute();
+              }
+              if (changed && id(is_embedded_thermostat) && is_home_page()) {
+                id(update_climate_chip).execute();
+              }
+              if (id(ccf_owner) == 2 && current_page_id == get_page_id("home")) {
+                id(ccf_paint_home).execute();
+              }
+
+interval:
+  - interval: 1s
+    startup_delay: 1s
+    then:
+      - script.execute: ccf_supervisor
+
+script:
+  - id: !extend dump_config
+    then:
+      - lambda: |-
+          #ifndef NSPANEL_EASY_ADDON_CLIMATE_HEAT
+            #error "Climate Controller Failover requires nspanel_esphome_addon_climate_heat.yaml."
+          #endif  // NSPANEL_EASY_ADDON_CLIMATE_HEAT
+          #ifdef NSPANEL_EASY_ADDON_CLIMATE_BACKUP
+            #error "Climate Controller Failover cannot be combined with the standard Climate Backup add-on."
+          #endif  // NSPANEL_EASY_ADDON_CLIMATE_BACKUP
+          #if defined(NSPANEL_EASY_ADDON_CLIMATE_COOL) || defined(NSPANEL_EASY_ADDON_CLIMATE_DUAL)
+            #error "Climate Controller Failover supports Heat only; remove Cool/Dual."
+          #endif  // NSPANEL_EASY_ADDON_CLIMATE_COOL || NSPANEL_EASY_ADDON_CLIMATE_DUAL
+          #ifdef NSPANEL_EASY_ADDON_COVER
+            #error "Climate Controller Failover cannot share physical relays with the Cover add-on."
+          #endif  // NSPANEL_EASY_ADDON_COVER
+          static_assert(${heater_relay} == 1 || ${heater_relay} == 2,
+                        "Climate Controller Failover: heater_relay must be 1 or 2.");
+          static_assert(${climate_failover_boot_wait_ms} >= 0 && ${climate_failover_boot_wait_ms} <= 2147483647LL,
+                        "climate_failover_boot_wait_ms must be 0..2147483647 milliseconds.");
+          static_assert(${climate_failover_loss_wait_ms} > 0 && ${climate_failover_loss_wait_ms} <= 2147483647LL,
+                        "climate_failover_loss_wait_ms must be 1..2147483647 milliseconds.");
+          static_assert(${climate_failover_return_wait_ms} > 0 && ${climate_failover_return_wait_ms} <= 2147483647LL,
+                        "climate_failover_return_wait_ms must be 1..2147483647 milliseconds.");
+          static_assert(${climate_failover_initial_target} >= ${temp_min} && ${climate_failover_initial_target} <= ${temp_max},
+                        "climate_failover_initial_target must be within temp_min..temp_max in panel units.");
+          ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}", "Climate Controller Failover:");
+          ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}", "  Heater relay: %u", static_cast<unsigned>(${heater_relay}));
+          ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}",
+                        "  Controller climate: ${controller_climate_entity}");
+          ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}",
+                        "  Heat request: ${controller_heat_request_entity}");
+
+  # Single output arbiter. No other action in this add-on directly switches the
+  # physical heating relay.
+  - id: ccf_apply_output
+    mode: restart
+    then:
+      - lambda: |-
+          bool demand = false;
+
+          if (id(ccf_owner) == 2) {
+            demand = std::isfinite(id(temp_nspanel).state) &&
+                     id(thermostat_embedded).mode == climate::CLIMATE_MODE_HEAT &&
+                     id(thermostat_embedded).action == climate::CLIMATE_ACTION_HEATING;
+          } else if (id(ccf_owner) == 1) {
+            demand = id(ccf_ha_ready) &&
+                     id(api_server).is_connected_with_state_subscription() &&
+                     is_blueprint_fully_ready() &&
+                     id(ccf_values_seen) == 7 &&
+                     id(ccf_ha_mode).state == "heat" &&
+                     id(ccf_ha_demand).state == "on";
+          }
+
+          if (id(ccf_heater_output).state != demand) {
+            if (demand) {
+              id(ccf_heater_output).turn_on();
+            } else {
+              id(ccf_heater_output).turn_off();
+            }
+          }
+
+  # Repeated supervision is deliberately used instead of relying only on
+  # connect/disconnect callbacks. HA is considered ready only when:
+  # - an API client with state subscriptions is connected,
+  # - the NSPanel Easy Blueprint handshake is complete, and
+  # - mode, target and heat-request values have all been received and are valid.
+  - id: ccf_supervisor
+    mode: single
+    then:
+      - lambda: |-
+          if (system_flags.ota_in_progress || system_flags.tft_upload_active) {
+            // Unobserved time during an update cannot count as stable readiness.
+            id(ccf_good_tracking) = false;
+            id(ccf_ha_ready) = false;
+            id(ccf_apply_output).execute();
+            return;
+          }
+
+          const uint32_t now = millis();
+          static bool bad_tracking = false;
+          static uint32_t bad_since = 0;
+          static uint32_t last_request = 0;
+          static uint32_t last_log = 0;
+
+          const bool connected = id(api_server).is_connected_with_state_subscription();
+          if (!connected) {
+            id(ccf_values_seen) = 0;
+          }
+
+          const bool blueprint_ok = is_blueprint_fully_ready();
+          const bool ready = connected && blueprint_ok && id(ccf_values_seen) == 7;
+          id(ccf_ha_ready) = ready;
+
+          if (connected && !blueprint_ok &&
+              (uint32_t)(now - last_request) >= 30000U) {
+            last_request = now;
+            id(boot_request_blueprint_settings).execute("timeout");
+          }
+
+          if (ready) {
+            bad_tracking = false;
+            if (!id(ccf_good_tracking)) {
+              id(ccf_good_tracking) = true;
+              id(ccf_good_since) = now;
+            }
+
+            if (id(ccf_owner) != 1 &&
+                (uint32_t)(now - id(ccf_good_since)) >= ${climate_failover_return_wait_ms}U) {
+              id(ccf_enter_ha).execute();
+            }
+
+            if (id(ccf_owner) == 1) {
+              #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+              id(ccf_saved_target) = fahrenheit_to_celsius(id(ccf_ha_target).state);
+              #else  // Celsius
+              id(ccf_saved_target) = id(ccf_ha_target).state;
+              #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+              id(ccf_saved_heat) = id(ccf_ha_mode).state == "heat";
+            }
+          } else {
+            id(ccf_good_tracking) = false;
+            if (!bad_tracking) {
+              bad_tracking = true;
+              bad_since = now;
+            }
+
+            const bool boot_expired = id(ccf_owner) == 0 && now >= ${climate_failover_boot_wait_ms}U;
+            const bool loss_expired = id(ccf_owner) == 1 &&
+              (uint32_t)(now - bad_since) >= ${climate_failover_loss_wait_ms}U;
+            if (boot_expired || loss_expired) {
+              id(ccf_enter_local).execute();
+            }
+          }
+
+          if (id(ccf_owner) == 2) {
+            if (!id(is_embedded_thermostat) || !id(is_climate)) {
+              id(is_embedded_thermostat) = true;
+              id(is_climate) = true;
+              id(update_flag_climate_embedded).execute();
+            }
+            if (!id(ccf_ui_started) && id(disp1).is_setup() &&
+                system_flags.display_settings_received) {
+              id(ccf_start_local_ui).execute();
+            }
+          } else if (id(thermostat_embedded).mode != climate::CLIMATE_MODE_OFF) {
+            auto call = id(thermostat_embedded).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+          }
+
+          id(ccf_apply_output).execute();
+
+          const char *status;
+          if (id(ccf_owner) == 0) {
+            status = "START";
+          } else if (id(ccf_owner) == 1) {
+            status = ready ? "HA" : "HA: checking readiness";
+          } else if (!connected) {
+            status = "LOCAL: no HA connection";
+          } else if (!blueprint_ok) {
+            status = "LOCAL: Blueprint not ready";
+          } else if (id(ccf_values_seen) != 7) {
+            status = "LOCAL: HA values missing";
+          } else {
+            status = "LOCAL: preparing handback";
+          }
+
+          if (id(ccf_status).state != status) {
+            id(ccf_status).publish_state(status);
+          }
+
+          if ((uint32_t)(now - last_log) >= 30000U) {
+            last_log = now;
+            ESP_LOGD("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}",
+                     "owner=%u api=%d blueprint=%d values=%u display=%d",
+                     (unsigned) id(ccf_owner), connected, blueprint_ok,
+                     (unsigned) id(ccf_values_seen), id(disp1).is_setup());
+          }
+
+  - id: ccf_enter_local
+    mode: single
+    then:
+      - lambda: |-
+          if (id(ccf_owner) == 2) {
+            return;
+          }
+
+          ESP_LOGW("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}", "Switching ownership to LOCAL");
+          const bool heat = id(ccf_saved_heat);
+          const auto traits = id(thermostat_embedded).get_traits();
+          float target = id(ccf_saved_target);
+          if (!std::isfinite(target)) {
+            #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+            target = fahrenheit_to_celsius(static_cast<float>(${climate_failover_initial_target}));
+            #else  // Celsius
+            target = static_cast<float>(${climate_failover_initial_target});
+            #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+          }
+          target = fmaxf(traits.get_visual_min_temperature(),
+                         fminf(target, traits.get_visual_max_temperature()));
+
+          id(ccf_owner) = 0;
+          id(ccf_apply_output).execute();
+          auto off = id(thermostat_embedded).make_call();
+          off.set_mode(climate::CLIMATE_MODE_OFF);
+          off.perform();
+          id(ccf_owner) = 2;
+          #ifdef NSPANEL_EASY_SUBSCRIBE
+          // Keep incoming HA data cached, but do not let its indoor-temperature
+          // binding paint over the local sensor while LOCAL owns the panel.
+          for (uint16_t i = 0; i < sub_count; i++) {
+            if (strcmp(sub_bindings[i].page, "home") == 0 &&
+                strcmp(sub_bindings[i].component, "indr_temp") == 0) {
+              sub_renderers[i] = nullptr;
+            }
+          }
+          #endif  // NSPANEL_EASY_SUBSCRIBE
+          id(ccf_ui_started) = false;
+          id(ccf_home_dirty) = true;
+          addon_climate_friendly_name = "${climate_failover_local_label}";
+          id(is_climate) = true;
+          id(is_embedded_thermostat) = true;
+
+          auto call = id(thermostat_embedded).make_call();
+          call.set_target_temperature(target);
+          call.set_mode(heat ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF);
+          call.perform();
+          id(ccf_apply_output).execute();
+
+  # Break-before-make transfer back to HA:
+  # 1. owner 0 disables both output paths,
+  # 2. local thermostat is turned off,
+  # 3. fresh HA target/mode are stored,
+  # 4. HA becomes the sole owner.
+  - id: ccf_enter_ha
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(ccf_ha_ready) || id(ccf_owner) == 1) {
+            return;
+          }
+
+          ESP_LOGI("${TAG_ADDON_CLIMATE_CONTROLLER_FAILOVER}", "Switching ownership to HA");
+          const bool was_local = id(ccf_owner) == 2;
+          id(ccf_start_local_ui).stop();
+          id(ccf_repair_climate).stop();
+
+          id(ccf_owner) = 0;
+          id(ccf_apply_output).execute();
+
+          auto call = id(thermostat_embedded).make_call();
+          call.set_mode(climate::CLIMATE_MODE_OFF);
+          call.perform();
+
+          #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+          id(ccf_saved_target) = fahrenheit_to_celsius(id(ccf_ha_target).state);
+          #else  // Celsius
+          id(ccf_saved_target) = id(ccf_ha_target).state;
+          #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+          id(ccf_saved_heat) = id(ccf_ha_mode).state == "heat";
+          id(ccf_owner) = 1;
+          #ifdef NSPANEL_EASY_SUBSCRIBE
+          for (uint16_t i = 0; i < sub_count; i++) {
+            if (strcmp(sub_bindings[i].page, "home") == 0 &&
+                strcmp(sub_bindings[i].component, "indr_temp") == 0) {
+              sub_renderers[i] = sub_resolve_renderer("home");
+            }
+          }
+          sub_render_all();
+          #endif  // NSPANEL_EASY_SUBSCRIBE
+          id(ccf_ui_started) = false;
+          id(is_climate) = true;
+          id(is_embedded_thermostat) = false;
+          climate_embedded_visible = false;
+          id(ccf_apply_output).execute();
+
+          if (id(disp1).is_setup()) {
+            id(update_flag_climate_embedded).execute();
+            if (was_local && current_page_id == get_page_id("climate")) {
+              id(detailed_entity).publish_state("${controller_climate_entity}");
+              id(goto_page).execute(get_page_id("home"));
+            } else if (was_local && current_page_id == get_page_id("home")) {
+              id(page_home).execute();
+            }
+          }
+
+  - id: !extend boot_nextion
+    then:
+      - lambda: |-
+          if (id(disp1).is_setup()) {
+            id(ccf_display_needs_init) = false;
+          }
+
+  - id: ccf_start_local_ui
+    mode: single
+    then:
+      - lambda: id(ccf_ui_started) = true;
+
+      - if:
+          condition:
+            lambda: |-
+              return id(ccf_display_needs_init) || !system_flags.boot_completed;
+          then:
+            - script.execute: boot_nextion
+            - script.wait: boot_nextion
+            - lambda: |-
+                if (id(ccf_owner) != 2 || !id(disp1).is_setup()) {
+                  return;
+                }
+                current_theme =
+                  id(background_type).current_option() == "${THEME_LIGHT_LABEL}" ?
+                    ThemeMode::LIGHT : ThemeMode::DARK;
+                id(theme_update_all).execute();
+                if (current_theme == ThemeMode::LIGHT) {
+                  id(theme_update_light).execute();
+                } else {
+                  id(theme_update_dark).execute();
+                }
+
+      - lambda: |-
+          if (id(ccf_owner) != 2 || !id(disp1).is_setup()) {
+            return;
+          }
+
+          id(is_climate) = true;
+          id(is_embedded_thermostat) = true;
+          id(ccf_home_dirty) = true;
+          addon_climate_friendly_name = "${climate_failover_local_label}";
+          if (id(detailed_entity).state != "${CLIMATE_EMBEDDED_SENTINEL}") {
+            id(detailed_entity).publish_state("${CLIMATE_EMBEDDED_SENTINEL}");
+          }
+          climate_embedded_visible = true;
+          id(update_flag_climate_embedded).execute();
+          id(disp1).send_command_printf("back_page_id=%u",
+                                        (unsigned) get_page_id("home"));
+          id(set_brightness).execute(id(display_brightness).state);
+
+          if (current_page_id == get_page_id("climate")) {
+            id(ccf_repair_climate).stop();
+            id(page_climate).execute();
+          } else {
+            id(goto_page).execute(get_page_id("climate"));
+          }
+
+  - id: !extend update_flag_climate_embedded
+    then:
+      - lambda: |-
+          if (id(ccf_owner) != 2) return;
+          id(is_embedded_thermostat) = true;
+          id(is_climate) = true;
+          addon_climate_friendly_name = "${climate_failover_local_label}";
+          id(disp1).send_command("climate_embedded=1");
+
+  - id: !extend resync_display
+    then:
+      - lambda: |-
+          if (id(ccf_owner) != 2) return;
+          id(ccf_ui_started) = false;
+          id(ccf_home_dirty) = true;
+          id(ccf_display_needs_init) = true;
+
+  - id: !extend reset_globals
+    then:
+      - lambda: |-
+          if (new_page_id != get_page_id("climate")) {
+            id(ccf_repair_climate).stop();
+          }
+          if (new_page_id == get_page_id("home")) {
+            id(ccf_home_dirty) = true;
+          }
+          if (id(ccf_owner) != 2 || new_page_id != get_page_id("climate")) {
+            return;
+          }
+
+          id(ccf_repair_climate).stop();
+          display_entity_keep = true;
+          addon_climate_friendly_name = "${climate_failover_local_label}";
+          if (id(detailed_entity).state != "${CLIMATE_EMBEDDED_SENTINEL}") {
+            id(detailed_entity).publish_state("${CLIMATE_EMBEDDED_SENTINEL}");
+          }
+          climate_embedded_visible = true;
+
+  - id: !extend page_home
+    then:
+      - lambda: |-
+          if (id(ccf_owner) == 2 && current_page_id == get_page_id("home")) {
+            id(ccf_paint_home).execute();
+          }
+
+  - id: ccf_repair_climate
+    mode: restart
+    then:
+      - delay: 80ms
+      - lambda: |-
+          if (id(ccf_owner) != 2 || !id(disp1).is_setup() ||
+              system_flags.tft_upload_active ||
+              current_page_id != get_page_id("climate")) {
+            return;
+          }
+
+          addon_climate_friendly_name = "${climate_failover_local_label}";
+          if (id(detailed_entity).state != "${CLIMATE_EMBEDDED_SENTINEL}") {
+            id(detailed_entity).publish_state("${CLIMATE_EMBEDDED_SENTINEL}");
+          }
+          climate_embedded_visible = true;
+          id(page_climate).execute();
+
+  - id: ccf_paint_home
+    mode: single
+    then:
+      - lambda: |-
+          if (id(ccf_owner) != 2 || !id(disp1).is_setup() ||
+              system_flags.tft_upload_active ||
+              current_page_id != get_page_id("home")) {
+            return;
+          }
+
+          char text[64];
+          if (std::isfinite(id(temp_nspanel).state)) {
+            float displayed_temperature = id(temp_nspanel).state;
+            #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+            displayed_temperature = celsius_to_fahrenheit(displayed_temperature);
+            snprintf(text, sizeof(text), "%.0f%s${temp_units}", displayed_temperature, id(units_separator).c_str());
+            #else  // Celsius
+            snprintf(text, sizeof(text), "%.1f%s${temp_units}", displayed_temperature, id(units_separator).c_str());
+            #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+          } else {
+            snprintf(text, sizeof(text), "%s", "${climate_failover_local_label}");
+          }
+          const std::string displayed_text = adjustDecimalSeparator(
+            text, id(mui_decimal_separator).empty() ? '.' : id(mui_decimal_separator)[0]);
+
+          static std::string previous_text;
+          static int previous_color = -1;
+          const int color = current_theme == ThemeMode::LIGHT ? 0 : 65535;
+          const bool force = id(ccf_home_dirty);
+
+          if (force || previous_text != displayed_text) {
+            id(disp1).set_component_text(hmi::home::INDR_TEMP.name, displayed_text.c_str());
+            previous_text = displayed_text;
+          }
+          if (force || previous_color != color) {
+            id(disp1).set_component_font_color(hmi::home::INDR_TEMP.name, color);
+            previous_color = color;
+          }
+          if (force) {
+            id(action_component_visibility).execute("home", "indr_temp", true);
+            id(action_component_visibility).execute("home", "indr_temp_icon", true);
+          }
+          id(ccf_home_dirty) = false;
+...

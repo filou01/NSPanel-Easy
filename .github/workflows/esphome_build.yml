@@ -120,6 +120,10 @@ jobs:
             yaml-file: .test/esphome_idf_climate_cool.yaml
           - name: Climate Heat
             yaml-file: .test/esphome_idf_climate_heat.yaml
+          - name: Climate Controller Failover
+            yaml-file: .test/esphome_idf_climate_controller_failover.yaml
+          - name: Climate Controller Failover (Fahrenheit)
+            yaml-file: .test/esphome_idf_climate_controller_failover_fahrenheit.yaml
           - name: Climate Dual
             yaml-file: .test/esphome_idf_climate_dual.yaml
           - name: Cover
@@ -170,6 +174,10 @@ jobs:
             yaml-file: .test/esphome_idf_climate_cool.yaml
           - name: Climate Heat
             yaml-file: .test/esphome_idf_climate_heat.yaml
+          - name: Climate Controller Failover
+            yaml-file: .test/esphome_idf_climate_controller_failover.yaml
+          - name: Climate Controller Failover (Fahrenheit)
+            yaml-file: .test/esphome_idf_climate_controller_failover_fahrenheit.yaml
           - name: Climate Dual
             yaml-file: .test/esphome_idf_climate_dual.yaml
           - name: Cover

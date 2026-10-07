@@ -1,0 +1,15 @@
+---
+substitutions:
+  heater_relay: "1"
+  controller_climate_entity: climate.test_controller
+  controller_heat_request_entity: input_boolean.test_heat_request
+  climate_failover_boot_wait_ms: "1000"
+  climate_failover_loss_wait_ms: "1000"
+  climate_failover_return_wait_ms: "1000"
+
+packages:
+  idf_common: !include esphome_idf_common.yaml
+  basic_package: !include ../nspanel_esphome.yaml
+  addon_climate_heat: !include ../esphome/nspanel_esphome_addon_climate_heat.yaml
+  addon_controller_failover: !include ../esphome/nspanel_esphome_addon_climate_controller_failover.yaml
+...

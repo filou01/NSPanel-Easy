@@ -46,6 +46,9 @@ Optional packages that extend the base firmware:
   Bluetooth range and track BLE devices through the panel.
 - [Add-on: Climate](addon_climate.md) — use the panel's relays as a local
   thermostat (heater, cooler, or both) that keeps working without Wi-Fi.
+- [Add-on: Climate Controller Failover](addon_climate_controller_failover.md) —
+  transfer heating control between an external Home Assistant controller and the
+  local thermostat, with a local outage UI and delayed return.
 - [Add-on: Cover](addon_cover.md) — drive a cover motor from the panel's
   relays.
 - [Add-on: Display Light](addon_display_light.md) — expose the display
